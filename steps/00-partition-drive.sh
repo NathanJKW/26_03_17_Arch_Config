@@ -160,10 +160,11 @@ select_disk() {
   local -a disks=()
   local i=0
   
-  # Parse lsblk to find top-level disks (exclude loop/rom/other non-disk types).
+  # Parse lsblk to find top-level disks (MODEL can contain spaces, so keep TYPE
+  # before MODEL to make awk field matching reliable).
   while IFS= read -r line; do
     disks+=("$line")
-  done < <(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" { $4=""; sub(/[[:space:]]+$/, ""); print }')
+  done < <(lsblk -d -n -o NAME,SIZE,TYPE,MODEL | awk '$3=="disk" { $3=""; sub(/^ +/, ""); sub(/[[:space:]]+$/, ""); print }')
   
   if [[ ${#disks[@]} -eq 0 ]]; then
     die "No block devices found"
