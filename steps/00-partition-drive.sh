@@ -12,6 +12,7 @@ readonly EFI_OPTIONS=(512 1024 2048)  # MiB options
 readonly EFI_DEFAULT=1024              # Default: 1 GiB
 readonly MNT_TEMP="/tmp/arch_format_mnt"
 readonly SUBVOLS=("@" "@home" "@snapshots" "@log" "@pkg")
+readonly REQUIRED_COMMANDS=(parted lsblk mkfs.fat mkfs.btrfs blkid btrfs mount umount mountpoint findmnt)
 
 # ============================================================================
 # Cleanup on exit/error
@@ -54,7 +55,7 @@ confirm() {
   local response
   
   while true; do
-    read -p "$prompt (Y/n): " response
+    read -r -p "$prompt (Y/n): " response
     response="${response:-Y}"
     case "$response" in
       [Yy]) return 0 ;;
@@ -64,15 +65,105 @@ confirm() {
   done
 }
 
+confirm_disk_erase() {
+  local disk="$1"
+  local typed
+
+  echo "Type the full disk path to confirm erase: $disk"
+  read -r -p "> " typed
+  [[ "$typed" == "$disk" ]] || die "Confirmation mismatch. Aborting to protect data."
+}
+
+partition_path() {
+  local disk="$1"
+  local part_num="$2"
+
+  # nvme0n1/mmcblk0 style devices need a 'p' separator.
+  if [[ "$disk" =~ [0-9]$ ]]; then
+    printf "%sp%s\n" "$disk" "$part_num"
+  else
+    printf "%s%s\n" "$disk" "$part_num"
+  fi
+}
+
+require_commands() {
+  local missing=()
+  local cmd
+
+  for cmd in "${REQUIRED_COMMANDS[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+
+  [[ ${#missing[@]} -eq 0 ]] || die "Missing required commands: ${missing[*]}"
+}
+
+assert_disk_not_mounted() {
+  local disk="$1"
+
+  [[ -b "$disk" ]] || die "Selected device is not a block device: $disk"
+
+  local mounted_entries
+  mounted_entries="$(lsblk -nrpo NAME,MOUNTPOINTS "$disk" | awk '$2 != ""')"
+  [[ -z "$mounted_entries" ]] || die "Disk or partitions are mounted. Unmount before continuing:\n$mounted_entries"
+}
+
+parent_disk_from_source() {
+  local src="$1"
+  local type
+  local pkname
+
+  [[ "$src" == /dev/* ]] || return 0
+
+  type="$(lsblk -no TYPE "$src" 2>/dev/null || true)"
+  if [[ "$type" == "disk" ]]; then
+    printf "%s\n" "$src"
+    return 0
+  fi
+
+  pkname="$(lsblk -no PKNAME "$src" 2>/dev/null || true)"
+  [[ -n "$pkname" ]] && printf "/dev/%s\n" "$pkname"
+}
+
+assert_not_live_media_disk() {
+  local selected_disk="$1"
+  local mount_path
+  local src
+  local parent
+
+  # Protect current system/root and common Arch ISO boot media mount.
+  for mount_path in / /run/archiso/bootmnt; do
+    src="$(findmnt -n -o SOURCE "$mount_path" 2>/dev/null || true)"
+    [[ -n "$src" ]] || continue
+    parent="$(parent_disk_from_source "$src")"
+    [[ -n "$parent" ]] || continue
+
+    if [[ "$parent" == "$selected_disk" ]]; then
+      die "Refusing to wipe active/live media disk: $selected_disk (in use by $mount_path via $src)"
+    fi
+  done
+}
+
+wait_for_partition() {
+  local part="$1"
+  local i
+
+  for i in {1..20}; do
+    [[ -b "$part" ]] && return 0
+    sleep 0.5
+  done
+
+  die "Partition device did not appear: $part"
+}
+
 select_disk() {
   log "Available disks:"
   local -a disks=()
   local i=0
   
-  # Parse lsblk to find block devices (skip partitions)
+  # Parse lsblk to find top-level disks (exclude loop/rom/other non-disk types).
   while IFS= read -r line; do
     disks+=("$line")
-  done < <(lsblk -d -n -o NAME,SIZE,MODEL | grep -v "^loop")
+  done < <(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" { $4=""; sub(/[[:space:]]+$/, ""); print }')
   
   if [[ ${#disks[@]} -eq 0 ]]; then
     die "No block devices found"
@@ -85,7 +176,7 @@ select_disk() {
   
   local choice
   while true; do
-    read -p "Select disk number (1-${#disks[@]}): " choice
+    read -r -p "Select disk number (1-${#disks[@]}): " choice
     if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#disks[@]})); then
       SELECTED_DISK="/dev/$(echo "${disks[$((choice - 1))]}" | awk '{print $1}')"
       return 0
@@ -105,7 +196,7 @@ get_efi_size() {
   
   local choice
   while true; do
-    read -p "Select EFI size (1-${#EFI_OPTIONS[@]}) [default: 2]: " choice
+    read -r -p "Select EFI size (1-${#EFI_OPTIONS[@]}) [default: 2]: " choice
     choice="${choice:-2}"
     if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#EFI_OPTIONS[@]})); then
       EFI_SIZE_MIB=${EFI_OPTIONS[$((choice - 1))]}
@@ -118,12 +209,16 @@ get_efi_size() {
 show_partition_plan() {
   local disk="$1"
   local efi_size="$2"
-  local btrfs_start=$((efi_size + 1))
+  local efi_part
+  local btrfs_part
+  efi_part="$(partition_path "$disk" 1)"
+  btrfs_part="$(partition_path "$disk" 2)"
   
   log "=== Partition Plan ==="
   printf "Disk: %s\n" "$disk"
   printf "Partition 1: %d MiB FAT32 (EFI)\n" "$efi_size"
   printf "Partition 2: Btrfs (remaining space)\n"
+  printf "Expected paths: %s (EFI), %s (Btrfs)\n" "$efi_part" "$btrfs_part"
   printf "\nBtrfs Subvolumes to create:\n"
   for sv in "${SUBVOLS[@]}"; do
     printf "  - %s\n" "$sv"
@@ -143,39 +238,42 @@ show_partition_plan() {
 partition_disk() {
   local disk="$1"
   local efi_size="$2"
+  local efi_end_mib=$((1 + efi_size))
+  local efi_part
+  local btrfs_part
+  efi_part="$(partition_path "$disk" 1)"
+  btrfs_part="$(partition_path "$disk" 2)"
   
   log "Creating GPT partition table and partitions..."
   
   # Create GPT table and partitions
-  # EFI: 1 MiB to (efi_size) MiB
-  # Btrfs: (efi_size+1) MiB to end
+  # EFI: 1 MiB to (1 + efi_size) MiB so size is exactly efi_size MiB
+  # Btrfs: starts immediately after EFI partition
   parted "$disk" --script \
     mklabel gpt \
-    mkpart ESP fat32 1MiB "${efi_size}MiB" \
+    mkpart ESP fat32 1MiB "${efi_end_mib}MiB" \
     set 1 esp on \
-    mkpart primary btrfs "${efi_size}MiB" 100%
-  
-  # Give kernel time to register partitions
-  sleep 2
+    mkpart primary btrfs "${efi_end_mib}MiB" 100%
+
+  partprobe "$disk" 2>/dev/null || true
+  udevadm settle 2>/dev/null || true
+
+  wait_for_partition "$efi_part"
+  wait_for_partition "$btrfs_part"
   
   log "Verifying partitions..."
-  if ! lsblk "$disk" -o NAME,TYPE,SIZE | grep -q part; then
-    die "Failed to create partitions on $disk"
-  fi
+  [[ -b "$efi_part" ]] || die "Missing EFI partition: $efi_part"
+  [[ -b "$btrfs_part" ]] || die "Missing Btrfs partition: $btrfs_part"
   
   log "Partitions created successfully"
 }
 
 format_filesystems() {
   local disk="$1"
-  local efi_part="${disk}p1"
-  local btrfs_part="${disk}p2"
-  
-  # Handle NVMe naming (e.g., /dev/nvme0n1 → /dev/nvme0n1p1)
-  if [[ $disk == *"nvme"* ]]; then
-    efi_part="${disk}p1"
-    btrfs_part="${disk}p2"
-  fi
+  local efi_part
+  local btrfs_part
+  efi_part="$(partition_path "$disk" 1)"
+  btrfs_part="$(partition_path "$disk" 2)"
   
   log "Formatting EFI partition: $efi_part"
   mkfs.fat -F32 "$efi_part" || die "Failed to format EFI partition"
@@ -196,12 +294,8 @@ format_filesystems() {
 
 create_subvolumes() {
   local disk="$1"
-  local btrfs_part="${disk}p2"
-  
-  # Handle NVMe naming
-  if [[ $disk == *"nvme"* ]]; then
-    btrfs_part="${disk}p2"
-  fi
+  local btrfs_part
+  btrfs_part="$(partition_path "$disk" 2)"
   
   log "Creating Btrfs subvolumes..."
   
@@ -228,14 +322,10 @@ create_subvolumes() {
 
 verify_setup() {
   local disk="$1"
-  local btrfs_part="${disk}p2"
+  local btrfs_part
+  btrfs_part="$(partition_path "$disk" 2)"
   
-  # Handle NVMe naming
-  if [[ $disk == *"nvme"* ]]; then
-    btrfs_part="${disk}p2"
-  fi
-  
-  log "=== Verification Phase ==="
+  log "=== Temporary mount verification ==="
   mkdir -p "$MNT_TEMP"
   
   log "Testing Btrfs subvolume mounts..."
@@ -268,14 +358,11 @@ verify_setup() {
 
 print_final_report() {
   local disk="$1"
-  local efi_part="${disk}p1"
-  local btrfs_part="${disk}p2"
-  
-  # Handle NVMe naming
-  if [[ $disk == *"nvme"* ]]; then
-    efi_part="${disk}p1"
-    btrfs_part="${disk}p2"
-  fi
+  local efi_part
+  local btrfs_part
+  local sv
+  efi_part="$(partition_path "$disk" 1)"
+  btrfs_part="$(partition_path "$disk" 2)"
   
   log "=== Final Verification Report ==="
   
@@ -296,7 +383,51 @@ print_final_report() {
   mount | grep "$MNT_TEMP" || true
   
   echo ""
-  echo "All verifications passed!"
+  echo "=== Success Summary ==="
+  echo "Selected disk: $disk"
+  echo "EFI size: ${EFI_SIZE_MIB} MiB"
+  echo "EFI partition: $efi_part"
+  echo "Btrfs partition: $btrfs_part"
+  echo "Subvolumes created:"
+  for sv in "${SUBVOLS[@]}"; do
+    echo "  - $sv"
+  done
+
+  echo ""
+  echo "=== Archinstall Handoff ==="
+  echo "Disk preparation complete."
+  echo ""
+  echo "Next step:"
+  echo "1. Run: archinstall"
+  echo "2. Choose: Use existing partitions"
+  echo "3. EFI partition: $efi_part mounted at /efi"
+  echo "4. Btrfs partition: $btrfs_part mounted at /"
+  echo "5. Profile: minimal"
+  echo "6. Bootloader: systemd-boot"
+  echo "7. Swap: none"
+  echo "8. Do not repartition or reformat the disk"
+  echo "9. Create your user and enable NetworkManager"
+  echo "10. If archinstall does not preserve this subvolume layout, use the manual mounts below first"
+  echo ""
+  echo "The Btrfs subvolumes are already created:"
+  echo "@, @home, @snapshots, @log, @pkg"
+  echo "Do not recreate them."
+
+  echo ""
+  echo "=== Warning ==="
+  echo "Use existing partitions only."
+  echo "Do not repartition."
+  echo "Do not reformat."
+
+  echo ""
+  echo "Optional manual mount commands before archinstall:"
+  echo "mount -o subvol=@,noatime,compress=zstd:3 $btrfs_part /mnt"
+  echo "mkdir -p /mnt/{home,.snapshots,var/log,var/cache/pacman/pkg,efi}"
+  echo "mount -o subvol=@home,noatime,compress=zstd:3 $btrfs_part /mnt/home"
+  echo "mount -o subvol=@snapshots,noatime,compress=zstd:3 $btrfs_part /mnt/.snapshots"
+  echo "mount -o subvol=@log,noatime,compress=zstd:3 $btrfs_part /mnt/var/log"
+  echo "mount -o subvol=@pkg,noatime,compress=zstd:3 $btrfs_part /mnt/var/cache/pacman/pkg"
+  echo "mount $efi_part /mnt/efi"
 }
 
 # ============================================================================
@@ -309,16 +440,17 @@ main() {
   echo ""
   
   require_root
+  require_commands
   
   # Phase 1: Pre-flight checks and user input
   log "Phase 1: Pre-flight Checks"
   select_disk
+  assert_disk_not_mounted "$SELECTED_DISK"
+  assert_not_live_media_disk "$SELECTED_DISK"
   log "Selected disk: $SELECTED_DISK"
   echo ""
-  
-  if ! confirm "WARNING: This will ERASE $SELECTED_DISK. Continue?"; then
-    die "Aborted by user"
-  fi
+
+  confirm_disk_erase "$SELECTED_DISK"
   echo ""
   
   get_efi_size
@@ -349,7 +481,7 @@ main() {
   echo ""
   
   # Phase 5: Verification
-  log "Phase 5: Verification & Mount Testing"
+  log "Phase 5: Temporary mount verification"
   verify_setup "$SELECTED_DISK"
   echo ""
   
@@ -360,7 +492,7 @@ main() {
   
   if confirm "Setup complete! Does everything look correct?"; then
     log "✓ SUCCESS: Your drive is ready for Arch installation!"
-    log "Next step: Run 01-base.sh to continue installation"
+    log "Follow the Archinstall handoff block above and start archinstall now."
   else
     die "User rejected final verification"
   fi
