@@ -88,7 +88,6 @@ select_disk() {
     read -p "Select disk number (1-${#disks[@]}): " choice
     if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#disks[@]})); then
       SELECTED_DISK="/dev/$(echo "${disks[$((choice - 1))]}" | awk '{print $1}')"
-      echo "$SELECTED_DISK"
       return 0
     fi
     echo "Invalid selection. Please enter a number between 1 and ${#disks[@]}"
@@ -110,7 +109,6 @@ get_efi_size() {
     choice="${choice:-2}"
     if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#EFI_OPTIONS[@]})); then
       EFI_SIZE_MIB=${EFI_OPTIONS[$((choice - 1))]}
-      echo "$EFI_SIZE_MIB"
       return 0
     fi
     echo "Invalid selection."
@@ -310,7 +308,7 @@ main() {
   
   # Phase 1: Pre-flight checks and user input
   log "Phase 1: Pre-flight Checks"
-  SELECTED_DISK=$(select_disk)
+  select_disk
   log "Selected disk: $SELECTED_DISK"
   echo ""
   
@@ -319,7 +317,7 @@ main() {
   fi
   echo ""
   
-  EFI_SIZE_MIB=$(get_efi_size)
+  get_efi_size
   log "Selected EFI size: $EFI_SIZE_MIB MiB"
   echo ""
   
