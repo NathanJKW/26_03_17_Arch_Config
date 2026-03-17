@@ -236,15 +236,19 @@ verify_setup() {
   fi
   
   log "=== Verification Phase ==="
-  
-  # Create temp directories for mount test
-  mkdir -p "$MNT_TEMP"/{home,.snapshots,var/log,var/cache/pacman/pkg}
+  mkdir -p "$MNT_TEMP"
   
   log "Testing Btrfs subvolume mounts..."
   
   # Mount root subvolume
   mount -o subvol=@,noatime,compress=zstd:3 "$btrfs_part" "$MNT_TEMP" || \
     die "Failed to mount root subvolume"
+
+  # Create mount points inside the mounted root subvolume.
+  mkdir -p "$MNT_TEMP/home" \
+    "$MNT_TEMP/.snapshots" \
+    "$MNT_TEMP/var/log" \
+    "$MNT_TEMP/var/cache/pacman/pkg"
   
   # Mount remaining subvolumes
   mount -o subvol=@home,noatime,compress=zstd:3 "$btrfs_part" "$MNT_TEMP/home" || \
