@@ -11,6 +11,7 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 readonly EFI_OPTIONS=(512 1024 2048)  # MiB options
 readonly EFI_DEFAULT=1024              # Default: 1 GiB
 readonly MNT_TEMP="/tmp/arch_format_mnt"
+readonly INSTALL_MNT="/mnt"
 readonly SUBVOLS=("@" "@home" "@snapshots" "@log" "@pkg")
 readonly REQUIRED_COMMANDS=(parted lsblk mkfs.fat mkfs.btrfs blkid btrfs mount umount mountpoint findmnt)
 
@@ -357,6 +358,44 @@ verify_setup() {
   log "All subvolume mounts successful"
 }
 
+mount_for_archinstall() {
+  local disk="$1"
+  local efi_part
+  local btrfs_part
+  efi_part="$(partition_path "$disk" 1)"
+  btrfs_part="$(partition_path "$disk" 2)"
+
+  log "Preparing final mounts at ${INSTALL_MNT} for archinstall..."
+
+  if mountpoint -q "$INSTALL_MNT" 2>/dev/null; then
+    die "${INSTALL_MNT} is already mounted. Unmount it first to avoid conflicts."
+  fi
+
+  mkdir -p "$INSTALL_MNT"
+  mount -o subvol=@,noatime,compress=zstd:3 "$btrfs_part" "$INSTALL_MNT"
+
+  mkdir -p "$INSTALL_MNT/home" \
+    "$INSTALL_MNT/.snapshots" \
+    "$INSTALL_MNT/var/log" \
+    "$INSTALL_MNT/var/cache/pacman/pkg" \
+    "$INSTALL_MNT/efi"
+
+  mount -o subvol=@home,noatime,compress=zstd:3 "$btrfs_part" "$INSTALL_MNT/home"
+  mount -o subvol=@snapshots,noatime,compress=zstd:3 "$btrfs_part" "$INSTALL_MNT/.snapshots"
+  mount -o subvol=@log,noatime,compress=zstd:3 "$btrfs_part" "$INSTALL_MNT/var/log"
+  mount -o subvol=@pkg,noatime,compress=zstd:3 "$btrfs_part" "$INSTALL_MNT/var/cache/pacman/pkg"
+  mount "$efi_part" "$INSTALL_MNT/efi"
+
+  mountpoint -q "$INSTALL_MNT" || die "Root mount missing at ${INSTALL_MNT}"
+  mountpoint -q "$INSTALL_MNT/home" || die "@home mount missing"
+  mountpoint -q "$INSTALL_MNT/.snapshots" || die "@snapshots mount missing"
+  mountpoint -q "$INSTALL_MNT/var/log" || die "@log mount missing"
+  mountpoint -q "$INSTALL_MNT/var/cache/pacman/pkg" || die "@pkg mount missing"
+  mountpoint -q "$INSTALL_MNT/efi" || die "EFI mount missing"
+
+  log "Final layout mounted at ${INSTALL_MNT} and ready for archinstall"
+}
+
 print_final_report() {
   local disk="$1"
   local efi_part
@@ -398,24 +437,18 @@ print_final_report() {
   echo "=== Archinstall Handoff ==="
   echo "Disk preparation complete."
   echo ""
-  echo "Do this next (recommended):"
-  echo "1. Manually mount the prepared layout:"
-  echo "   mount -o subvol=@,noatime,compress=zstd:3 $btrfs_part /mnt"
-  echo "   mkdir -p /mnt/{home,.snapshots,var/log,var/cache/pacman/pkg,efi}"
-  echo "   mount -o subvol=@home,noatime,compress=zstd:3 $btrfs_part /mnt/home"
-  echo "   mount -o subvol=@snapshots,noatime,compress=zstd:3 $btrfs_part /mnt/.snapshots"
-  echo "   mount -o subvol=@log,noatime,compress=zstd:3 $btrfs_part /mnt/var/log"
-  echo "   mount -o subvol=@pkg,noatime,compress=zstd:3 $btrfs_part /mnt/var/cache/pacman/pkg"
-  echo "   mount $efi_part /mnt/efi"
-  echo "2. Run: archinstall"
-  echo "3. In archinstall disk config: choose 'Use pre-mounted configuration' if available"
-  echo "4. If pre-mounted is not available: choose manual partitioning"
-  echo "5. Assign only: $efi_part -> /efi and $btrfs_part -> /"
-  echo "6. Filesystem: btrfs (keep existing), do not auto-create subvolumes"
-  echo "7. Bootloader: systemd-boot"
-  echo "8. Swap: none"
-  echo "9. Profile: minimal (or your preferred profile)"
-  echo "10. Create your user and enable NetworkManager"
+  echo "The script has already mounted your prepared layout at ${INSTALL_MNT}."
+  echo ""
+  echo "Next step:"
+  echo "1. Run: archinstall"
+  echo "2. In disk config: choose 'Use pre-mounted configuration' if available"
+  echo "3. If pre-mounted is not available: choose manual partitioning"
+  echo "4. Assign only: $efi_part -> /efi and $btrfs_part -> /"
+  echo "5. Filesystem: btrfs (keep existing), do not auto-create subvolumes"
+  echo "6. Bootloader: systemd-boot"
+  echo "7. Swap: none"
+  echo "8. Profile: minimal (or your preferred profile)"
+  echo "9. Create your user and enable NetworkManager"
   echo ""
   echo "The Btrfs subvolumes are already created:"
   echo "@, @home, @snapshots, @log, @pkg"
@@ -428,16 +461,6 @@ print_final_report() {
   echo "Do not repartition."
   echo "Do not reformat."
   echo "Do not let archinstall recreate subvolumes."
-
-  echo ""
-  echo "Manual mount commands (same as step 1 above):"
-  echo "mount -o subvol=@,noatime,compress=zstd:3 $btrfs_part /mnt"
-  echo "mkdir -p /mnt/{home,.snapshots,var/log,var/cache/pacman/pkg,efi}"
-  echo "mount -o subvol=@home,noatime,compress=zstd:3 $btrfs_part /mnt/home"
-  echo "mount -o subvol=@snapshots,noatime,compress=zstd:3 $btrfs_part /mnt/.snapshots"
-  echo "mount -o subvol=@log,noatime,compress=zstd:3 $btrfs_part /mnt/var/log"
-  echo "mount -o subvol=@pkg,noatime,compress=zstd:3 $btrfs_part /mnt/var/cache/pacman/pkg"
-  echo "mount $efi_part /mnt/efi"
 }
 
 # ============================================================================
@@ -499,10 +522,19 @@ main() {
   log "Phase 6: Final Report"
   print_final_report "$SELECTED_DISK"
   echo ""
+
+  # Phase 7: Prepare live mounts for immediate archinstall
+  log "Phase 7: Mounting final layout for archinstall"
+  mount_for_archinstall "$SELECTED_DISK"
+  echo ""
   
   if confirm "Setup complete! Does everything look correct?"; then
     log "✓ SUCCESS: Your drive is ready for Arch installation!"
-    log "Follow the Archinstall handoff block above and start archinstall now."
+    if command -v archinstall >/dev/null 2>&1 && confirm "Start archinstall now?"; then
+      archinstall
+    else
+      log "Run archinstall when ready. ${INSTALL_MNT} is mounted and ready."
+    fi
   else
     die "User rejected final verification"
   fi
