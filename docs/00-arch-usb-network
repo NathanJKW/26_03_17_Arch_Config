@@ -1,0 +1,7 @@
+iwctl
+device list
+station <your-device> scan
+station <your-device> get-networks
+station <your-device> connect <wifi-name>
+exit
+ping archlinux.org
