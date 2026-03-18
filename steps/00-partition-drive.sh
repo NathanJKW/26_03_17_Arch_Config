@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# CONFIG
-# -----------------------------------------------------------------------------
 DISK="/dev/nvme0n1"
 EFI_SIZE_MIB=1024
 
-# -----------------------------------------------------------------------------
-# CONSTANTS
-# -----------------------------------------------------------------------------
 TEMP_MOUNT="/tmp/arch-btrfs-setup"
 INSTALL_MOUNT="/mnt"
 
-# -----------------------------------------------------------------------------
-# FAIL HANDLER
-# -----------------------------------------------------------------------------
 fail() {
   echo "FAIL"
   exit 1
@@ -23,9 +14,6 @@ fail() {
 
 trap fail ERR
 
-# -----------------------------------------------------------------------------
-# HELPERS
-# -----------------------------------------------------------------------------
 partition_path() {
   local num="$1"
   if [[ "$DISK" =~ [0-9]$ ]]; then
@@ -42,9 +30,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
 main() {
   local efi_end efi_part btrfs_part
 
@@ -80,13 +65,13 @@ main() {
   mkdir -p "$INSTALL_MOUNT/.snapshots"
   mkdir -p "$INSTALL_MOUNT/var/log"
   mkdir -p "$INSTALL_MOUNT/var/cache/pacman/pkg"
-  mkdir -p "$INSTALL_MOUNT/efi"
+  mkdir -p "$INSTALL_MOUNT/boot"
 
   mount -o subvol=@home,noatime,compress=zstd "$btrfs_part" "$INSTALL_MOUNT/home"
   mount -o subvol=@snapshots,noatime,compress=zstd "$btrfs_part" "$INSTALL_MOUNT/.snapshots"
   mount -o subvol=@log,noatime,compress=zstd "$btrfs_part" "$INSTALL_MOUNT/var/log"
   mount -o subvol=@pkg,noatime,compress=zstd "$btrfs_part" "$INSTALL_MOUNT/var/cache/pacman/pkg"
-  mount "$efi_part" "$INSTALL_MOUNT/efi"
+  mount "$efi_part" "$INSTALL_MOUNT/boot"
 
   echo "PASS"
 }
